@@ -1,4 +1,7 @@
 # Twingate Connect Action
+
+[![CI](https://github.com/Twingate/github-action/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/Twingate/github-action/actions/workflows/ci.yaml)
+
 A GitHub action for connecting to Twingate
 
 # Purpose
@@ -19,6 +22,84 @@ There are two common use cases:
     service-key: ${{ secrets.EXAMPLE_SERVICE_KEY_SECRET_NAME }}
 ```
 
+# Inputs
+
+## service-key (required)
+The Twingate Service Key used to connect to the proper Twingate service.
+
+## cache (optional)
+Enable or disable caching of Twingate packages to improve action performance.
+
+- **Type**: boolean
+- **Default**: `true`
+- **Values**: `true` or `false`
+
+### Caching Behavior
+
+When `cache: true` (default):
+- Detects the latest Twingate package version available
+- Saves downloaded packages to the GitHub Actions cache
+- Restores cached packages on subsequent runs, reducing installation time by 30-45%
+- Works across all supported runners (Linux x64/ARM, Windows)
+
+When `cache: false`:
+- Skips all caching operations
+- Always downloads and installs fresh packages
+- Useful for ensuring fresh installations or when caching is not desired
+
+## cache-version (optional)
+Cache version suffix for invalidating cached packages when needed.
+
+- **Type**: string
+- **Default**: `3`
+
+Increment this value to invalidate the cache and force a fresh download on the next run.
+
+## debug (optional)
+Enable debug output for troubleshooting.
+
+- **Type**: boolean
+- **Default**: `false`
+- **Values**: `true` or `false`
+
+When enabled, provides detailed logging of:
+- Version detection process
+- Cache directory operations
+- MSI/DEB file validation
+- Network requests and responses
+
+# Examples
+
+### Basic usage with caching (default)
+```yaml
+- uses: twingate/github-action@v1
+  with:
+    service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+```
+
+### Disable caching
+```yaml
+- uses: twingate/github-action@v1
+  with:
+    service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+    cache: false
+```
+
+### Enable debug logging
+```yaml
+- uses: twingate/github-action@v1
+  with:
+    service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+    debug: true
+```
+
+### Invalidate cache and force fresh download
+```yaml
+- uses: twingate/github-action@v1
+  with:
+    service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+    cache-version: 4
+```
 
 # Development
 
@@ -31,11 +112,40 @@ It'll ask for `SERVICE_KEY` value interactively.
 
 # How To Release
 
-When releasing a new tag (`v1.4` for example) we also have to update the latest major version (`v1` in this case)
-to point to it.
-Example steps:
+This repository uses a dual-tagging strategy where each release has both a specific version tag (e.g., `v1.6`) and an updated major version tag (e.g., `v1`) that always points to the latest release.
 
+## Automated Release (Recommended)
+
+Use the `release.sh` script to automate the entire release process:
+
+```bash
+# Auto-increment from the latest tag (e.g., v1.6 -> v1.7)
+./release.sh
+
+# Release a specific version
+./release.sh v1.8
+./release.sh 1.8  # v prefix is optional
+
+# Preview what would happen without making changes
+./release.sh --dry-run
+
+# Get help
+./release.sh --help
 ```
+
+The script will:
+1. Validate prerequisites (clean git status, gh CLI installed and authenticated)
+2. Determine the version (from argument or auto-increment)
+3. Create both the specific version tag and update the major version tag
+4. Push tags to origin
+5. Create a GitHub release with auto-generated notes
+
+## Manual Release (Fallback)
+
+If you need to release manually, follow these steps:
+
+```bash
+# Example for releasing v1.4
 git tag v1.4
 git tag v1 -f
 git push origin v1 v1.4 -f
