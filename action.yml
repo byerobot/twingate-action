@@ -22,6 +22,21 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Mask service key
+      shell: bash
+      env:
+        TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
+      run: |
+        # Mask the full value and each non-trivial line so multi-line keys never appear in logs
+        echo "::add-mask::$TWINGATE_SERVICE_KEY"
+        while IFS= read -r line; do
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          if [ "${#line}" -gt 8 ]; then
+            echo "::add-mask::$line"
+          fi
+        done <<< "$TWINGATE_SERVICE_KEY"
+
     - name: Error if unsupported runner.os
       if: runner.os != 'Linux' && runner.os != 'Windows'
       shell: bash
@@ -227,11 +242,13 @@ runs:
     - name: Setup and start Twingate (Linux)
       if: runner.os == 'Linux'
       shell: bash
+      env:
+        TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
       run: |
         export DEBUG_MODE='${{ inputs.debug }}'
         source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
 
-        echo '${{ inputs.service-key }}' | $SUDO twingate setup --headless -
+        printf '%s' "$TWINGATE_SERVICE_KEY" | $SUDO twingate setup --headless -
 
         # Fail fast on runners that fundamentally can't run a VPN client
         # (e.g. ubuntu-slim), instead of retrying silently until timeout.
@@ -287,12 +304,14 @@ runs:
     - name: Setup and Start Twingate (Windows)
       if: runner.os == 'Windows'
       shell: powershell
+      env:
+        TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
       run: |
         $env:DEBUG_MODE = '${{ inputs.debug }}'
         . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
 
         # Install Twingate client and start service
-        Set-Content .\key.json  '${{ inputs.service-key }}'
+        Set-Content .\key.json $env:TWINGATE_SERVICE_KEY
         $key_path = (Get-Item .\key.json | Resolve-Path).ProviderPath
 
         try {
