@@ -11,6 +11,14 @@ inputs:
     description: 'Enable debug output'
     required: false
     default: "false"
+  cache-version:
+    description: 'Cache version suffix for invalidating cached packages'
+    required: false
+    default: "3"
+  cache:
+    description: 'Enable caching of Twingate packages'
+    required: false
+    default: "true"
 runs:
   using: "composite"
   steps:
@@ -18,63 +26,249 @@ runs:
       if: runner.os != 'Linux' && runner.os != 'Windows'
       shell: bash
       run: |
-        echo "Unsupported Runner OS: ${{ runner.os }}"
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+        log ERROR "Unsupported Runner OS: ${{ runner.os }}"
         exit 1
 
-    - name: Install Twingate (Linux)
+    - name: Install prerequisites (Linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        # Add Twingate repository
-        echo "deb [trusted=yes] https://packages.twingate.com/apt/ /" | sudo tee /etc/apt/sources.list.d/twingate.list
-    
-        # Retry apt-get update up to 5 times with exponential backoff
+        # Check if we're in a minimal container environment missing required tools
+        MISSING_DEPS=""
+        command -v curl >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS curl"
+        command -v gpg >/dev/null 2>&1 || MISSING_DEPS="$MISSING_DEPS gnupg"
+
+        if [ -n "$MISSING_DEPS" ]; then
+          # Detect if we need sudo for package installation
+          source "$GITHUB_ACTION_PATH/scripts/sudo-detect.sh"
+
+          echo "Installing missing dependencies: $MISSING_DEPS"
+          $SUDO apt-get update
+          $SUDO apt-get install -y $MISSING_DEPS
+        fi
+
+    - name: Get latest Twingate version (Linux)
+      if: runner.os == 'Linux' && inputs.cache == 'true'
+      id: twingate-version-linux
+      shell: bash
+      run: |
+        export DEBUG_MODE='${{ inputs.debug }}'
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+
+        VERSION=$(get_twingate_version)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+        OS_VERSION=$(get_os_version)
+        echo "os_version=$OS_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Get latest Twingate version (Windows)
+      if: runner.os == 'Windows' && inputs.cache == 'true'
+      id: twingate-version-windows
+      shell: powershell
+      run: |
+        $env:DEBUG_MODE = '${{ inputs.debug }}'
+        . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
+
+        $version = Get-TwingateVersion
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+
+        $osVersion = Get-OSVersion
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "os_version=$osVersion"
+
+    - name: Setup cache directory (Linux)
+      if: runner.os == 'Linux' && inputs.cache == 'true' && steps.twingate-version-linux.outputs.version != 'unknown'
+      shell: bash
+      run: mkdir -p ~/.twingate-cache
+
+    - name: Cache Twingate package and dependencies (Linux)
+      if: runner.os == 'Linux' && inputs.cache == 'true' && steps.twingate-version-linux.outputs.version != 'unknown'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: cache-twingate-linux
+      with:
+        path: ~/.twingate-cache
+        key: twingate-cache-v${{ inputs.cache-version }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.twingate-version-linux.outputs.os_version }}-v${{ steps.twingate-version-linux.outputs.version }}
+
+    - name: Setup cache directory (Windows)
+      if: runner.os == 'Windows' && inputs.cache == 'true' && steps.twingate-version-windows.outputs.version != 'unknown'
+      shell: powershell
+      run: |
+        $cacheDir = "${{ runner.temp }}\twingate-cache"
+        if (-not (Test-Path $cacheDir)) {
+          New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        }
+        if ('${{ inputs.debug }}' -eq 'true') { Write-Host "[DEBUG] Cache directory: $cacheDir" }
+
+    - name: Cache Twingate MSI (Windows)
+      if: runner.os == 'Windows' && inputs.cache == 'true' && steps.twingate-version-windows.outputs.version != 'unknown'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: cache-twingate-windows
+      with:
+        path: ${{ runner.temp }}\twingate-cache
+        key: twingate-cache-v${{ inputs.cache-version }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.twingate-version-windows.outputs.os_version }}-v${{ steps.twingate-version-windows.outputs.version }}
+
+    - name: Validate cached package (Linux)
+      if: runner.os == 'Linux' && inputs.cache == 'true' && steps.cache-twingate-linux.outputs.cache-hit == 'true'
+      id: validate-cache-linux
+      shell: bash
+      run: |
+        export DEBUG_MODE='${{ inputs.debug }}'
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+
+        VALID=$(validate_cache_linux)
+        echo "valid=$VALID" >> $GITHUB_OUTPUT
+
+    - name: Validate cached MSI (Windows)
+      if: runner.os == 'Windows' && inputs.cache == 'true' && steps.cache-twingate-windows.outputs.cache-hit == 'true'
+      id: validate-cache-windows
+      shell: powershell
+      run: |
+        $env:DEBUG_MODE = '${{ inputs.debug }}'
+        . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
+
+        $cacheDir = "${{ runner.temp }}\twingate-cache"
+        $isValid = Validate-CacheWindows -CacheDir $cacheDir
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "valid=$isValid"
+
+    - name: Install Twingate from cache (Linux)
+      if: runner.os == 'Linux' && inputs.cache == 'true' && steps.validate-cache-linux.outputs.valid == 'true'
+      shell: bash
+      run: |
+        export DEBUG_MODE='${{ inputs.debug }}'
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+
+        log DEBUG "Installing Twingate from cache"
+        # Install all packages from cache directory (twingate + dependencies)
+        $SUDO dpkg -i ~/.twingate-cache/*.deb || true
+        $SUDO apt-get install -f -yq
+
+    - name: Copy cached MSI to working directory (Windows)
+      if: runner.os == 'Windows' && inputs.cache == 'true' && steps.validate-cache-windows.outputs.valid == 'true'
+      shell: powershell
+      run: |
+        $env:DEBUG_MODE = '${{ inputs.debug }}'
+        . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
+
+        log DEBUG "Copying cached MSI to working directory"
+        $cacheDir = "${{ runner.temp }}\twingate-cache"
+        $msiFile = Get-ChildItem -Path $cacheDir -Filter "twingate*.msi" | Select-Object -First 1
+
+        if ($msiFile) {
+          log DEBUG "Using cached MSI: $($msiFile.Name)"
+          Copy-Item -Path $msiFile.FullName -Destination ".\twingate_client.msi" -Force
+        } else {
+          log DEBUG "No cached MSI found, will download"
+          exit 1
+        }
+
+    - name: Install Twingate (Linux)
+      if: runner.os == 'Linux' && (inputs.cache != 'true' || steps.cache-twingate-linux.outputs.cache-hit != 'true' || steps.validate-cache-linux.outputs.valid != 'true' || steps.twingate-version-linux.outputs.version == 'unknown')
+      shell: bash
+      run: |
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+
+        install_twingate_gpg_key
+
+        # Add Twingate repository with GPG key verification
+        echo "deb [signed-by=/usr/share/keyrings/twingate-client-keyring.gpg] https://packages.twingate.com/apt/ * *" | $SUDO tee /etc/apt/sources.list.d/twingate.list
+
+        # Retry apt-get update with exponential backoff to survive transient mirror failures
         max_retries=5
         delay=5
         for i in $(seq 1 $max_retries); do
-          if sudo apt-get update; then
-            echo "apt-get update succeeded"
+          if $SUDO apt-get update; then
             break
-          else
-            echo "apt-get update failed, retrying ($i/$max_retries) in $delay seconds..."
-            sleep $delay
-            delay=$((delay * 2))  # exponential backoff
           fi
+          echo "apt-get update failed, retrying ($i/$max_retries) in $delay seconds..."
+          sleep $delay
+          delay=$((delay * 2))
         done
-    
-        # Install Twingate
-        sudo apt-get -yq -o DPkg::Lock::Timeout=60 install twingate
+        $SUDO apt-get update -o Dir::Etc::sourcelist="sources.list.d/twingate.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
+
+        # Download all packages to cache if caching is enabled
+        if [ "${{ steps.twingate-version-linux.outputs.version }}" != "unknown" ]; then
+          mkdir -p ~/.twingate-cache
+          # Download Twingate and all dependencies to cache directory
+          $SUDO apt-get install -yq --download-only -o Dir::Cache::Archives="$HOME/.twingate-cache" twingate
+          # Install to resolve any missing dependencies, then download them
+          $SUDO apt-get install -yq --download-only -o Dir::Cache::Archives="$HOME/.twingate-cache" -f
+          # Fix permissions so cache action can save files
+          $SUDO chown -R "$(id -u)":"$(id -g)" "$HOME/.twingate-cache"
+        fi
+
+        $SUDO apt-get install -yq -o DPkg::Lock::Timeout=60 twingate
+
+    - name: Download and cache Twingate MSI (Windows)
+      if: runner.os == 'Windows' && (inputs.cache != 'true' || steps.cache-twingate-windows.outputs.cache-hit != 'true' || steps.validate-cache-windows.outputs.valid != 'true' || steps.twingate-version-windows.outputs.version == 'unknown')
+      shell: powershell
+      run: |
+        $env:DEBUG_MODE = '${{ inputs.debug }}'
+        . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
+
+        $ProgressPreference = 'SilentlyContinue'
+        $msiUrl = "https://api.twingate.com/download/windows?installer=msi"
+        log DEBUG "Downloading Twingate from $msiUrl"
+        Invoke-WebRequest -Uri $msiUrl -OutFile ".\twingate_client.msi"
+
+        # Cache the MSI if caching is enabled
+        if ('${{ steps.twingate-version-windows.outputs.version }}' -ne 'unknown') {
+          $cacheDir = "${{ runner.temp }}\twingate-cache"
+          if (-not (Test-Path $cacheDir)) {
+            New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+          }
+
+          $version = '${{ steps.twingate-version-windows.outputs.version }}'
+          $msiCachePath = "$cacheDir\twingate-client-$version.msi"
+          log DEBUG "Caching MSI to $msiCachePath"
+          Copy-Item -Path ".\twingate_client.msi" -Destination $msiCachePath -Force
+          Get-ChildItem -Path $cacheDir | ForEach-Object { log DEBUG "Cache: $($_.Name) ($($_.Length) bytes)" }
+        }
     
     - name: Setup and start Twingate (Linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        echo '${{ inputs.service-key }}' | sudo twingate setup --headless -
+        export DEBUG_MODE='${{ inputs.debug }}'
+        source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
+
+        echo '${{ inputs.service-key }}' | $SUDO twingate setup --headless -
+
+        # Fail fast on runners that fundamentally can't run a VPN client
+        # (e.g. ubuntu-slim), instead of retrying silently until timeout.
+        check_network_capabilities || exit 1
+
         MAX_RETRIES=5
         WAIT_TIME=5
         n=0
 
         while [ $n -lt $MAX_RETRIES ]; do
-          echo "Starting Twingate service..."
+          log INFO "Starting Twingate service..."
           set +xe
           twingate start
 
-          echo "Waiting $WAIT_TIME seconds for Twingate service to start..."
+          log INFO "Waiting $WAIT_TIME seconds for Twingate service to start..."
           sleep $WAIT_TIME
 
           status=$(twingate status)
-          echo "Twingate service status: '$status'"
+          log INFO "Twingate service status: '$status'"
 
           if [ "$status" = "online" ]; then
-            echo "Twingate service is connected."
-            if [ "${{ inputs.debug }}" != "false" ]; then
+            log INFO "Twingate service is connected."
+            if [ "${{ inputs.debug }}" = "true" ]; then
               twingate resources
             fi
             break
           else
             twingate stop
-            if [ "${{ inputs.debug }}" != "false" ]; then
-              journalctl -u twingate --no-pager
+            if [ "${{ inputs.debug }}" = "true" ]; then
+              # journalctl is empty without systemd (container runners); the
+              # forked daemon logs to /var/log/twingated.log instead.
+              if [ -d /run/systemd/system ]; then
+                journalctl -u twingate --no-pager
+              else
+                log INFO "systemd not present; dumping /var/log/twingated.log"
+                $SUDO cat /var/log/twingated.log 2>/dev/null || log INFO "no daemon log found"
+              fi
             fi
           fi
 
@@ -82,27 +276,146 @@ runs:
           n=$((n+1))
           WAIT_TIME=$((WAIT_TIME+5))
 
-          echo "Twingate service is not connected. Retrying ..."
+          log INFO "Twingate service is not connected. Retrying..."
         done
 
         if [ $n -eq $MAX_RETRIES ]; then
-          echo "Twingate service failed to connect."
+          log ERROR "Twingate service failed to connect."
           exit 1
         fi
 
-    - name: Install and Start Twingate (Windows)
+    - name: Setup and Start Twingate (Windows)
       if: runner.os == 'Windows'
       shell: powershell
       run: |
-          Invoke-WebRequest https://api.twingate.com/download/windows?installer=msi -OutFile .\twingate_client.msi
+        $env:DEBUG_MODE = '${{ inputs.debug }}'
+        . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
 
-          Set-Content .\key.json  '${{ inputs.service-key }}'
-          $key_path = (Get-Item .\key.json | Resolve-Path).ProviderPath
+        # Install Twingate client and start service
+        Set-Content .\key.json  '${{ inputs.service-key }}'
+        $key_path = (Get-Item .\key.json | Resolve-Path).ProviderPath
 
+        try {
+          log INFO "Installing Twingate client..."
           Start-Process msiexec.exe -Wait -ArgumentList "/i twingate_client.msi /l*v install.log log_level=debug service_secret=$key_path /quiet"
+        } finally {
+          # Clean up the secret file immediately after MSI exits
+          if (Test-Path .\key.json) {
+            Remove-Item .\key.json -Force -ErrorAction SilentlyContinue
+            log DEBUG "Cleaned up temporary secret file"
+          }
+        }
 
-          Start-Sleep -Seconds 1
-          Start-Service twingate.service
+        # Start Twingate service with comprehensive retry logic
+        $MAX_RETRIES = 5
+        $WAIT_TIME = 5
+        $retry_count = 0
+        $service_started = $false
+        $SERVICE_NAME = 'twingate.service'
 
-          Start-Sleep -Seconds 14
-          Get-Service twingate.service
+        while ($retry_count -lt $MAX_RETRIES) {
+          log INFO "Starting Twingate service (attempt $($retry_count + 1)/$MAX_RETRIES)..."
+
+          # Check if service exists
+          try {
+            $service = Get-Service $SERVICE_NAME -ErrorAction Stop
+            log DEBUG "Service found: $($service.Name)"
+          } catch {
+            log ERROR "Service '$SERVICE_NAME' not found: $_"
+            exit 1
+          }
+
+          # Attempt to start the service
+          try {
+            if ($service.Status -eq 'Stopped') {
+              Start-Service $SERVICE_NAME -ErrorAction Stop
+              log INFO "Service start command executed successfully"
+            } elseif ($service.Status -eq 'Running') {
+              log DEBUG "Service is already in Running state"
+            } else {
+              log WARNING "Service is in $($service.Status) state, attempting to start anyway"
+              Start-Service $SERVICE_NAME -ErrorAction Stop
+            }
+          } catch {
+            log ERROR "Failed to start service: $_"
+            $retry_count++
+            if ($retry_count -lt $MAX_RETRIES) {
+              log INFO "Retrying service start in $WAIT_TIME seconds..."
+              Start-Sleep -Seconds $WAIT_TIME
+              $WAIT_TIME += 5
+              continue
+            } else {
+              break
+            }
+          }
+
+          log INFO "Waiting $WAIT_TIME seconds for Twingate service to initialize..."
+          Start-Sleep -Seconds $WAIT_TIME
+
+          # Verify service is actually running
+          $status_check_attempts = 3
+          $status_check_delay = 2
+          $final_status = $null
+
+          for ($i = 0; $i -lt $status_check_attempts; $i++) {
+            try {
+              $service = Get-Service $SERVICE_NAME -ErrorAction Stop
+              $final_status = $service.Status
+              log INFO "Service status check #$($i + 1): $final_status"
+
+              if ($final_status -eq 'Running') {
+                log DEBUG "Service confirmed as Running"
+                break
+              } elseif ($i -lt ($status_check_attempts - 1)) {
+                log DEBUG "Service not yet Running, waiting $status_check_delay seconds before next check..."
+                Start-Sleep -Seconds $status_check_delay
+              }
+            } catch {
+              log ERROR "Failed to check service status: $_"
+              $final_status = 'Unknown'
+            }
+          }
+
+          if ($final_status -eq 'Running') {
+            log INFO "Twingate service is running successfully."
+            if ($env:DEBUG_MODE -eq 'true') {
+              try {
+                $serviceDetails = Get-Service $SERVICE_NAME -ErrorAction Stop
+                log DEBUG "Service details: Name=$($serviceDetails.Name), Status=$($serviceDetails.Status), DisplayName=$($serviceDetails.DisplayName)"
+              } catch {
+                log DEBUG "Could not retrieve service details: $_"
+              }
+            }
+            $service_started = $true
+            break
+          } else {
+            log ERROR "Service status is '$final_status', not Running"
+
+            # Attempt to stop the service before retrying
+            try {
+              $service = Get-Service $SERVICE_NAME -ErrorAction Stop
+              if ($service.Status -ne 'Stopped') {
+                log INFO "Stopping service before retry..."
+                Stop-Service $SERVICE_NAME -ErrorAction Stop
+                Start-Sleep -Seconds 2
+              }
+            } catch {
+              log DEBUG "Could not stop service: $_"
+            }
+          }
+
+          # Increment retry counter and wait time
+          $retry_count++
+          $WAIT_TIME += 5
+
+          if ($retry_count -lt $MAX_RETRIES) {
+            log INFO "Twingate service is not running. Retrying in $WAIT_TIME seconds..."
+          }
+        }
+
+        if (-not $service_started) {
+          log ERROR "Twingate service failed to start after $MAX_RETRIES retries (waiting up to 75 seconds total)"
+          exit 1
+        }
+
+        log INFO "Twingate service startup completed successfully"
