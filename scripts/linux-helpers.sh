@@ -14,6 +14,19 @@ log() {
   echo "[$level] $@" >&2
 }
 
+# Mask a secret line-by-line, as GitHub does (a multi-line key leaks otherwise).
+# Defense-in-depth; the real fix is keeping the value out of the run script (#93).
+# Uses `if`, not `[ -n ] && echo`: on a blank last line (e.g. a key saved with a
+# trailing newline) the `&&` form returns 1 and aborts the `bash -e` caller.
+mask_secret() {
+  local line
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      echo "::add-mask::$line"
+    fi
+  done <<< "$1"
+}
+
 get_twingate_version() {
   local version
   version=$(curl -sf https://packages.twingate.com/apt/Packages | awk '/^Package: twingate$/,/^Version:/ {if (/^Version:/) print $2}' | sort -V | tail -1)

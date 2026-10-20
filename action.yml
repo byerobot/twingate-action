@@ -22,21 +22,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Mask service key
-      shell: bash
-      env:
-        TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
-      run: |
-        # Mask the full value and each non-trivial line so multi-line keys never appear in logs
-        echo "::add-mask::$TWINGATE_SERVICE_KEY"
-        while IFS= read -r line; do
-          line="${line#"${line%%[![:space:]]*}"}"
-          line="${line%"${line##*[![:space:]]}"}"
-          if [ "${#line}" -gt 8 ]; then
-            echo "::add-mask::$line"
-          fi
-        done <<< "$TWINGATE_SERVICE_KEY"
-
     - name: Error if unsupported runner.os
       if: runner.os != 'Linux' && runner.os != 'Windows'
       shell: bash
@@ -243,12 +228,22 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       env:
+        # Via env, not inline ${{ }}: GitHub prints the expanded run script and
+        # leaked the key (issue #93).
         TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
       run: |
         export DEBUG_MODE='${{ inputs.debug }}'
         source "$GITHUB_ACTION_PATH/scripts/linux-helpers.sh"
 
-        printf '%s' "$TWINGATE_SERVICE_KEY" | $SUDO twingate setup --headless -
+        mask_secret "$TWINGATE_SERVICE_KEY"
+
+        # `setup` does not switch networks while the client is running, and
+        # `start` is a no-op once it is online, so a second connection in the
+        # same job would report success while still attached to the previous
+        # network.
+        twingate stop >/dev/null 2>&1 || true
+
+        printf '%s\n' "$TWINGATE_SERVICE_KEY" | $SUDO twingate setup --headless -
 
         # Fail fast on runners that fundamentally can't run a VPN client
         # (e.g. ubuntu-slim), instead of retrying silently until timeout.
@@ -305,10 +300,16 @@ runs:
       if: runner.os == 'Windows'
       shell: powershell
       env:
+        # Via env, not inline ${{ }}: GitHub prints the expanded run script and
+        # leaked the key (issue #93).
         TWINGATE_SERVICE_KEY: ${{ inputs.service-key }}
       run: |
         $env:DEBUG_MODE = '${{ inputs.debug }}'
         . "$env:GITHUB_ACTION_PATH/scripts/windows-helpers.ps1"
+
+        $env:TWINGATE_SERVICE_KEY -split "`n" | ForEach-Object {
+          if ($_ -ne '') { Write-Host "::add-mask::$($_.TrimEnd())" }
+        }
 
         # Install Twingate client and start service
         Set-Content .\key.json $env:TWINGATE_SERVICE_KEY
